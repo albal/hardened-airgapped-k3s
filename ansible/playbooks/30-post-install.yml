@@ -1,0 +1,67 @@
+---
+# Pull cluster access back to the installer and record what each node ended up
+# being called, so the shell side can build the demo ConfigMap and label nodes.
+- name: Collect cluster access
+  hosts: server[0]
+  gather_facts: false
+  become: true
+  vars:
+    output_dir: /output
+  tasks:
+    - name: Wait for the kubeconfig to exist
+      ansible.builtin.wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        timeout: 180
+
+    - name: Read the kubeconfig
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: post_kubeconfig
+
+    # kubeconfig_endpoint is the VIP when one is configured, so kubectl stops
+    # depending on node 1 being up. It falls back to api_endpoint, which is what
+    # the nodes actually join through.
+    - name: Write it out with the real API endpoint
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        content: >-
+          {{ post_kubeconfig.content | b64decode
+             | replace('https://127.0.0.1:6443',
+                       'https://' ~ (kubeconfig_endpoint | default(api_endpoint))
+                       ~ ':' ~ (api_port | default(6443))) }}
+        dest: "{{ output_dir }}/kubeconfig"
+        mode: "0600"
+
+- name: Record node identities and hardware facts
+  hosts: k3s_cluster
+  gather_facts: true
+  become: false
+  strategy: linear
+  vars:
+    output_dir: /output
+    # A real tab. A YAML *block* scalar (the content below) passes backslash
+    # sequences through untouched, so join('\t') there produces the two
+    # characters \ and t, not a tab - and every consumer of this file splits on
+    # tabs. A double-quoted scalar like this one does process the escape.
+    tsv_sep: "\t"
+  tasks:
+    # index / k8s node name / ssh address / os / kernel / arch / cpus / memory
+    - name: Write nodes.tsv
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.copy:
+        dest: "{{ output_dir }}/nodes.tsv"
+        mode: "0644"
+        content: |-
+          {% for host in groups['k3s_cluster'] %}
+          {% set f = hostvars[host]['ansible_facts'] %}
+          {{ [loop.index,
+              f['hostname'],
+              host,
+              f['distribution'] ~ ' ' ~ f['distribution_version'],
+              f['kernel'],
+              f['architecture'],
+              f['processor_vcpus'] | default(f['processor_cores'], true),
+              ((f['memtotal_mb'] | int / 1024) | round(1)) ~ ' GiB'] | join(tsv_sep) }}
+          {% endfor %}

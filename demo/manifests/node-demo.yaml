@@ -1,0 +1,129 @@
+---
+# Rendered with envsubst by the installer.
+#   ${DEMO_NAMESPACE} ${DEMO_IMAGE_REF} ${DEMO_NODEPORT}
+#
+# A DaemonSet plus a NodePort Service with externalTrafficPolicy: Local means
+# http://<node-N>:<nodeport> is always answered by the pod on that node, so each
+# node IP shows its own "Node N" page.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${DEMO_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: k3s-node-demo
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-demo
+  namespace: ${DEMO_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: node-demo
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-demo
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-demo
+      annotations:
+        # Roll the pods whenever the per-node ConfigMap changes.
+        checksum/config: "${DEMO_CONFIG_CHECKSUM}"
+    spec:
+      imagePullSecrets:
+        - name: harbor-pull
+      automountServiceAccountToken: false
+      # Servers carry no taints in a default k3s install, but tolerate them anyway
+      # so the demo still lands on every node in a tainted cluster.
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: ${DEMO_IMAGE_REF}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - { name: node-demo-config, mountPath: /etc/node-demo, readOnly: true }
+            - { name: html, mountPath: /usr/share/nginx/html }
+            - { name: cache, mountPath: /var/cache/nginx }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: node-demo-config
+          configMap:
+            name: node-demo
+        # tmpfs, so a read-only root filesystem still has the few writable
+        # paths nginx and the render script need.
+        - { name: html, emptyDir: { medium: Memory, sizeLimit: 4Mi } }
+        - { name: cache, emptyDir: { medium: Memory, sizeLimit: 16Mi } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 4Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-demo
+  namespace: ${DEMO_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: node-demo
+spec:
+  type: NodePort
+  # Keep traffic on the node it arrived at, so each node IP serves its own page.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: node-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: ${DEMO_NODEPORT}

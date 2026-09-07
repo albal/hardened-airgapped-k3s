@@ -1,0 +1,15 @@
+.git
+.gitmodules
+k3s-ansible/.git
+k3s-ansible/.github
+k3s-ansible/tests
+k3s-ansible/Vagrantfile
+dist
+docs
+artifacts/*.part
+artifacts/**/*.part
+artifacts/helm-*.tar.gz
+artifacts/kubectl.sha256
+artifacts/k3s-sha256sum-*.txt
+tests
+.github

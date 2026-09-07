@@ -1,0 +1,56 @@
+---
+# Longhorn values for an airgapped cluster.
+#
+# Applied by the installer, which adds the replica count, data path and UI
+# service type from config/versions.env on the command line.
+
+# Images are pre-imported into every node's containerd from the airgap bundle.
+image:
+  pullPolicy: IfNotPresent
+
+persistence:
+  # Longhorn is the cluster's default StorageClass: a PVC that does not name one
+  # should get replicated storage, not a directory pinned to a single node.
+  # k3s's local-path is kept but demoted by the installer, so exactly one class
+  # claims the default - two would make the choice arbitrary.
+  defaultClass: true
+  defaultClassReplicaCount: 3
+  defaultDataLocality: disabled
+  reclaimPolicy: Delete
+
+defaultSettings:
+  # The data disk is mounted here by the node-prep playbook.
+  defaultDataPath: /var/lib/longhorn
+
+  # Spread replicas across nodes, never two on one machine - otherwise losing a
+  # node can take out every copy.
+  replicaSoftAntiAffinity: false
+
+  # Zones, however, must stay soft. Bare-metal nodes carry no
+  # topology.kubernetes.io/zone label, so Longhorn sees them all as one empty
+  # zone; with this strict it can place exactly one replica per volume and every
+  # volume sits permanently "degraded" with ReplicaSchedulingFailure.
+  # Set it false only if the nodes really are zone-labelled.
+  replicaZoneSoftAntiAffinity: true
+
+  # Both of these reach out to the internet on a timer. On an airgapped network
+  # they achieve nothing except log noise and failed DNS lookups.
+  upgradeChecker: false
+  allowCollectingLonghornUsageMetrics: false
+
+  # Refuse to schedule replicas onto a nearly-full disk.
+  storageMinimalAvailablePercentage: 15
+  storageOverProvisioningPercentage: 100
+
+  # Let Longhorn drain and reschedule replicas when a node is cordoned.
+  nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
+
+longhornUI:
+  replicas: 1
+
+# Longhorn's own CSI sidecars come from the airgap bundle; never look upstream.
+csi:
+  attacherReplicaCount: 3
+  provisionerReplicaCount: 3
+  resizerReplicaCount: 3
+  snapshotterReplicaCount: 3

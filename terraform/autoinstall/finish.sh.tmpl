@@ -1,0 +1,87 @@
+#!/bin/bash
+# autoinstall late-command. Runs in the live installer with the installed system
+# mounted at /target.
+#
+# Same job as the Debian ../preseed/d-i-finish.sh: give this machine the identity
+# its MAC says it should have, and let the airgapped installer log in as root.
+set -eu
+
+LOG=/var/log/autoinstall-finish.log
+exec >>"${LOG}" 2>&1
+echo "=== autoinstall-finish $(date -u) ==="
+
+# MAC|HOSTNAME|ADDRESS/CIDR|GATEWAY|DNS  ('|' because tab is an IFS whitespace
+# character and consecutive tabs would collapse, losing empty fields)
+NODE_TABLE='@@NODE_TABLE@@'
+DOMAIN='@@DOMAIN@@'
+ROOT_PASSWORD='@@ROOT_PASSWORD@@'
+
+hostname=""
+for dev in /sys/class/net/*; do
+  [ -e "${dev}/address" ] || continue
+  devname="$(basename "${dev}")"
+  [ "${devname}" = "lo" ] && continue
+  devmac="$(tr 'A-Z' 'a-z' < "${dev}/address")"
+  echo "interface ${devname} has MAC ${devmac}"
+  while IFS='|' read -r mac name _addr _gw _ns; do
+    [ -n "${mac:-}" ] || continue
+    [ "$(echo "${mac}" | tr 'A-Z' 'a-z')" = "${devmac}" ] || continue
+    echo "${name}" > /tmp/match
+  done <<TABLE
+${NODE_TABLE}
+TABLE
+  if [ -f /tmp/match ]; then
+    hostname="$(cat /tmp/match)"; rm -f /tmp/match
+    echo "matched node '${hostname}' on ${devname}"
+    break
+  fi
+done
+
+if [ -z "${hostname}" ]; then
+  suffix="$(cat /sys/class/net/*/address 2>/dev/null | grep -v '00:00:00:00:00:00' \
+            | head -n1 | tr -d ':' | tail -c 7)"
+  hostname="ubuntu-${suffix:-unknown}"
+  echo "WARNING: no table entry for this machine's MAC; falling back to ${hostname}"
+fi
+
+echo "${hostname}" > /target/etc/hostname
+{
+  echo "127.0.0.1	localhost"
+  if [ -n "${DOMAIN}" ]; then
+    echo "127.0.1.1	${hostname}.${DOMAIN}	${hostname}"
+  else
+    echo "127.0.1.1	${hostname}"
+  fi
+  echo ""
+  echo "::1	localhost ip6-localhost ip6-loopback"
+  echo "ff02::1	ip6-allnodes"
+  echo "ff02::2	ip6-allrouters"
+} > /target/etc/hosts
+echo "hostname set to ${hostname}"
+
+# Ubuntu locks the root account, and autoinstall's identity section only creates
+# an unprivileged user. The airgapped installer authenticates as root, so give
+# root a password and let it log in.
+curtin in-target --target=/target -- bash -c "echo 'root:${ROOT_PASSWORD}' | chpasswd"
+
+mkdir -p /target/etc/ssh/sshd_config.d
+cat > /target/etc/ssh/sshd_config.d/99-k3s-installer.conf <<'SSHD'
+# Added by the k3s autoinstall so the airgapped installer can reach this node.
+# Remove once the cluster is built, or replace with key-based access.
+PermitRootLogin yes
+PasswordAuthentication yes
+SSHD
+chmod 0644 /target/etc/ssh/sshd_config.d/99-k3s-installer.conf
+
+# Same as the Debian path: stop systemd-ssh-generator probing for an AF_VSOCK
+# device this VM does not have, which otherwise logs on every daemon-reload.
+if ! grep -q 'systemd.ssh_auto=' /target/etc/default/grub 2>/dev/null; then
+  sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 systemd.ssh_auto=no"/' \
+    /target/etc/default/grub
+  curtin in-target --target=/target -- update-grub 2>/dev/null || true
+  echo "disabled systemd-ssh-generator's vsock probing"
+fi
+
+cp "${LOG}" /target/var/log/ 2>/dev/null || true
+echo "=== autoinstall-finish done ==="
+exit 0

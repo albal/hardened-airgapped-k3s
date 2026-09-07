@@ -1,0 +1,41 @@
+name: Integration
+
+# The container-based playbook tests. Kept off the pull-request path on purpose:
+# they need Docker, privileged containers and staged .debs, and take minutes
+# rather than seconds. Run them from the Actions tab when the Ansible content
+# changes in a way the static checks cannot judge.
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: OS image to build the fake nodes from
+        default: "debian:13"
+        type: choice
+        options: ["debian:13", "debian:12", "ubuntu:26.04", "ubuntu:24.04"]
+  schedule:
+    # Weekly, so a drifting base image or upstream package is noticed without
+    # anyone having to remember to look.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  playbooks:
+    name: Playbooks against ${{ inputs.base_image || 'debian:13' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The harness builds its own minimal ansible runner when the full
+      # installer image is not present, so all CI has to provide is the offline
+      # .debs for the release under test - seconds, not two gigabytes.
+      - name: Stage the offline .debs
+        run: ./tests/ansible/stage-test-debs.sh "${{ inputs.base_image || 'debian:13' }}"
+
+      - name: Run the integration suite
+        env:
+          BASE_IMAGE: ${{ inputs.base_image || 'debian:13' }}
+        run: ./tests/ansible/run-integration.sh

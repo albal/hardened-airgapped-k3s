@@ -1,0 +1,27 @@
+---
+# Mirrors the style the vendored k3s-ansible collection uses, so the two trees
+# do not disagree about formatting.
+extends: default
+
+ignore: |
+  k3s-ansible/
+  artifacts/
+  dist/
+  terraform/.terraform/
+  .github/
+
+rules:
+  line-length:
+    max: 160
+    level: warning
+  truthy:
+    allowed-values: ["true", "false"]
+  comments:
+    min-spaces-from-content: 1
+  # ansible-lint requires this off, and warns on every run otherwise.
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

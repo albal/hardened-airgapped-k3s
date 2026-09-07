@@ -1,0 +1,212 @@
+---
+# Gets each node ready for Longhorn: the iSCSI stack it attaches volumes with,
+# and a filesystem on the data disk mounted where Longhorn expects to find it.
+#
+# This is the one playbook here that can destroy data, so it will only put a
+# filesystem on a device that carries no signature at all - no partition table,
+# no filesystem, no RAID or LVM metadata. Anything else and it stops and says so
+# rather than guessing.
+- name: Prepare nodes for Longhorn
+  hosts: k3s_cluster
+  gather_facts: true
+  become: true
+  vars:
+    longhorn_data_path: /var/lib/longhorn
+    longhorn_fs_label: longhorn
+    longhorn_data_device: ""          # set to e.g. /dev/sdb to skip auto-detection
+    longhorn_skip_multipath: false    # true = leave an in-use multipathd alone
+    longhorn_min_disk_gb: 16
+  tasks:
+    # -----------------------------------------------------------------------
+    # iSCSI: Longhorn attaches every volume to the node over iSCSI
+    # -----------------------------------------------------------------------
+    - name: Check the iSCSI tooling is installed
+      ansible.builtin.command:
+        cmd: dpkg-query -W -f=${Status} open-iscsi
+      register: longhorn_iscsi_pkg
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Fail clearly if open-iscsi is missing
+      ansible.builtin.assert:
+        that: "'install ok installed' in longhorn_iscsi_pkg.stdout"
+        fail_msg: >-
+          open-iscsi is not installed on {{ inventory_hostname }} and Longhorn
+          cannot attach volumes without it. It should have come from the offline
+          .deb bundle - check that OFFLINE_DEB_IMAGES in config/versions.env
+          covers this node's OS release, re-run scripts/01-download-artifacts.sh
+          and rebuild the installer.
+
+    # Tagged so the container-based tests can skip them: a container has no
+    # /lib/modules of its own, and loading a module from one would affect the
+    # host kernel. Verified on real nodes instead - see tests/README.md.
+    - name: Load the iscsi_tcp kernel module
+      community.general.modprobe:
+        name: iscsi_tcp
+        state: present
+        persistent: present
+      tags: [iscsi]
+
+    - name: Start and enable iscsid
+      ansible.builtin.systemd_service:
+        name: iscsid
+        state: started
+        enabled: true
+      tags: [iscsi]
+
+    # multipathd claims Longhorn's block devices and the volume then fails to
+    # mount. It is not installed by default on Debian/Ubuntu, so usually this
+    # just confirms there is nothing to do.
+    - name: Gather service state
+      ansible.builtin.service_facts:
+      check_mode: false
+
+    # Ubuntu Server installs multipath-tools by default; Debian does not. Left
+    # alone it grabs the /dev/sd* devices Longhorn creates when it attaches a
+    # volume, and the volume then fails to mount with a confusing device-busy
+    # error. Blacklisting them is the fix Longhorn documents.
+    - name: Handle multipathd
+      when: >-
+        'multipathd.service' in (ansible_facts.services | default({}))
+        and ansible_facts.services['multipathd.service'].state == 'running'
+      block:
+        - name: Check whether multipathd is actually managing anything
+          ansible.builtin.command:
+            cmd: multipath -ll
+          register: longhorn_multipath_maps
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Refuse to touch a multipath setup that is in use
+          when:
+            - not longhorn_skip_multipath
+            - (longhorn_multipath_maps.stdout | trim) | length > 0
+          ansible.builtin.fail:
+            msg: >-
+              multipathd on {{ inventory_hostname }} is managing real multipath
+              devices, and it will also claim the devices Longhorn creates,
+              which makes volumes fail to mount. Blacklisting them here could
+              break your existing storage, so this is left for you: add a
+              blacklist for the Longhorn devnodes to /etc/multipath.conf, or
+              set longhorn_skip_multipath=true to accept the risk.
+              multipath -ll reported:
+              {{ longhorn_multipath_maps.stdout | trim }}
+
+        - name: Ensure the multipath drop-in directory exists
+          when: (longhorn_multipath_maps.stdout | trim) | length == 0
+          ansible.builtin.file:
+            path: /etc/multipath/conf.d
+            state: directory
+            mode: "0755"
+
+        - name: Blacklist Longhorn's devices from multipathd
+          when: (longhorn_multipath_maps.stdout | trim) | length == 0
+          ansible.builtin.copy:
+            dest: /etc/multipath/conf.d/99-longhorn.conf
+            mode: "0644"
+            content: |
+              # Written by the k3s installer.
+              # multipathd otherwise claims the /dev/sd* devices Longhorn creates
+              # when attaching a volume, and the volume fails to mount.
+              blacklist {
+                  devnode "^sd[a-z0-9]+"
+              }
+          notify: Restart multipathd
+
+    # -----------------------------------------------------------------------
+    # The data disk
+    # -----------------------------------------------------------------------
+    - name: Look for a disk we have already prepared
+      ansible.builtin.command:
+        cmd: blkid -L {{ longhorn_fs_label }}
+      register: longhorn_existing
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # The selection rules live in files/detect-longhorn-disk.sh so they can be
+    # unit-tested against fake sysfs trees - see tests/ansible/unit/. This task
+    # decides which disk gets reformatted, so it is worth testing properly.
+    - name: Find an unused disk to give to Longhorn
+      when:
+        - longhorn_data_device | length == 0
+        - longhorn_existing.rc != 0
+      ansible.builtin.script:
+        cmd: files/detect-longhorn-disk.sh {{ longhorn_min_disk_gb }}
+        executable: /bin/sh
+      register: longhorn_candidates
+      changed_when: false
+      check_mode: false
+
+    - name: Decide which device to use
+      ansible.builtin.set_fact:
+        longhorn_device: >-
+          {{
+            longhorn_data_device if longhorn_data_device | length > 0
+            else (longhorn_existing.stdout | trim if longhorn_existing.rc == 0
+                  else (longhorn_candidates.stdout_lines | default([]) | first | default('')))
+          }}
+        longhorn_already_prepared: "{{ longhorn_existing.rc == 0 }}"
+
+    - name: No usable disk found
+      when: longhorn_device | length == 0
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} has no spare disk for Longhorn. Attach one -
+          `data_disk_size` in terraform/terraform.tfvars adds a 128 GB disk to
+          each VM - or set longhorn_data_device if the disk is there but this
+          playbook did not recognise it. Disks seen:
+          {{ ansible_facts['devices'].keys() | select('match', '^(sd|vd|nvme|xvd)') | list | join(', ') }}
+
+    - name: More than one empty disk - refuse to guess
+      when:
+        - not longhorn_already_prepared
+        - longhorn_data_device | length == 0
+        - (longhorn_candidates.stdout_lines | default([])) | length > 1
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} has several empty disks
+          ({{ longhorn_candidates.stdout_lines | join(', ') }}) and this playbook
+          will not pick one for you, because picking wrong destroys whatever is
+          on it. Set longhorn_data_device to the one you mean.
+
+    - name: Confirm the device is genuinely empty before touching it
+      when: not longhorn_already_prepared
+      ansible.builtin.command:
+        cmd: blkid -p {{ longhorn_device }}
+      register: longhorn_probe
+      changed_when: false
+      check_mode: false
+      failed_when: longhorn_probe.rc == 0
+
+    - name: Create the filesystem
+      when: not longhorn_already_prepared
+      community.general.filesystem:
+        dev: "{{ longhorn_device }}"
+        fstype: ext4
+        opts: -L {{ longhorn_fs_label }} -m 0
+      register: longhorn_mkfs
+
+    - name: Mount it where Longhorn looks for its data
+      ansible.posix.mount:
+        path: "{{ longhorn_data_path }}"
+        src: LABEL={{ longhorn_fs_label }}
+        fstype: ext4
+        opts: defaults,noatime
+        state: mounted
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ longhorn_device }}
+          ({{ (ansible_facts['devices'][longhorn_device | basename]['size']) | default('unknown size') }})
+          {{ 'already prepared,' if longhorn_already_prepared else 'formatted ext4,' }}
+          mounted at {{ longhorn_data_path }}
+
+  handlers:
+    - name: Restart multipathd
+      ansible.builtin.systemd_service:
+        name: multipathd
+        state: restarted

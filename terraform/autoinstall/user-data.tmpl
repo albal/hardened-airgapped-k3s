@@ -1,0 +1,60 @@
+#cloud-config
+# Ubuntu Server autoinstall (subiquity). The Debian equivalent is
+# ../preseed/preseed.cfg.tmpl - the two installers share no configuration
+# format at all, which is why this file exists separately.
+#
+# Rendered by build-install-iso.sh, which substitutes the doubled-at
+# placeholders, and served to the installer from /cdrom/nocloud/ on the ISO.
+autoinstall:
+  version: 1
+
+  # Nothing may prompt. If the installer stops on a screen, some section below
+  # is incomplete and subiquity fell back to asking.
+  interactive-sections: []
+
+  locale: @@LOCALE@@
+  keyboard:
+    layout: @@KEYMAP@@
+  timezone: @@TIMEZONE@@
+
+  # The hostname here is a placeholder; the late command replaces it with the
+  # name matching this machine's MAC, so one ISO installs every node.
+  identity:
+    hostname: unassigned-hostname
+    username: @@ADMIN_USER@@
+    password: "@@PASSWORD_HASH@@"
+
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # 'size: smallest' picks the boot disk rather than Longhorn's much larger data
+  # disk. Without a match, subiquity can install onto whichever it enumerates
+  # first, and on a Proxmox VM that is not reliably the boot disk.
+  storage:
+    layout:
+      name: direct
+      match:
+        size: smallest
+
+  apt:
+    preserve_sources_list: false
+    primary:
+      - arches: [default]
+        uri: @@MIRROR_URL@@
+
+  packages:
+    - python3            # Ansible cannot run without it
+    - python3-apt
+    - qemu-guest-agent
+    - open-iscsi         # Longhorn attaches volumes over iSCSI
+    - nfs-common
+    - cryptsetup
+    - policycoreutils
+
+  # Do not reboot into the installer again on the next boot.
+  shutdown: reboot
+
+@@NETWORK_SECTION@@
+  late-commands:
+    - /bin/bash /cdrom/nocloud/finish.sh

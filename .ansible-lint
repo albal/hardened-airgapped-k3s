@@ -1,0 +1,23 @@
+---
+# Only our own playbooks. k3s-ansible is vendored upstream code with its own
+# lint config; holding it to ours would just create noise we cannot fix.
+exclude_paths:
+  - k3s-ansible/
+  - artifacts/
+  - dist/
+  - tests/ansible/fixtures/
+  - terraform/
+
+profile: basic
+
+# Roles live in the submodule; these playbooks are driven by the installer with
+# a generated inventory, so there is no galaxy metadata to check.
+skip_list:
+  - galaxy
+  - name[template]
+
+# Justified, per-rule:
+#   var-naming[no-role-prefix] - the vars are consumed by the vendored roles,
+#     which define the names; renaming them would break the integration.
+warn_list:
+  - var-naming[no-role-prefix]

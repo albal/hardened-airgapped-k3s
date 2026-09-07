@@ -1,0 +1,63 @@
+---
+# Harbor values shared by two consumers:
+#   * scripts/01-download-artifacts.sh renders the chart with these values to
+#     discover the exact image set to pre-pull (so the list is never hand-maintained)
+#   * the airgapped installer applies them, adding externalURL / admin password /
+#     NodePort on the command line.
+#
+# Everything that would reach out to the internet is switched off.
+
+expose:
+  type: nodePort
+  tls:
+    enabled: false          # plain HTTP; containerd is pointed at it via registries.yaml
+  nodePort:
+    name: harbor
+    ports:
+      http:
+        port: 80
+
+# Images are pre-imported into containerd from the airgap bundle, so never try
+# to reach docker.io.
+imagePullPolicy: IfNotPresent
+
+# ReadWriteOnce PVCs + RollingUpdate deadlock on a small cluster.
+updateStrategy:
+  type: Recreate
+
+persistence:
+  enabled: true
+  resourcePolicy: keep
+  # The installer overrides these four with the class it actually resolves
+  # (longhorn normally, local-path when --skip-longhorn). They are named here so
+  # a plain `helm install` with this file still does the right thing.
+  #
+  # Putting the registry on Longhorn is the point: on local-path the volume - and
+  # so every image in it - lived on whichever node happened to schedule the pod
+  # first, which is exactly the single point of failure the VIP removes elsewhere.
+  persistentVolumeClaim:
+    registry:
+      storageClass: longhorn
+      size: 20Gi
+    jobservice:
+      jobLog:
+        storageClass: longhorn
+        size: 1Gi
+    database:
+      storageClass: longhorn
+      size: 5Gi
+    redis:
+      storageClass: longhorn
+      size: 1Gi
+
+# Trivy pulls its vulnerability database from the internet on startup - useless
+# and noisy in an airgapped cluster.
+trivy:
+  enabled: false
+
+metrics:
+  enabled: false
+trace:
+  enabled: false
+cache:
+  enabled: false

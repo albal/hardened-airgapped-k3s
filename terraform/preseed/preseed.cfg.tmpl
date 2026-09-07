@@ -1,0 +1,140 @@
+#_preseed_V1
+# Debian installer preseed for the airgapped k3s nodes.
+#
+# Rendered by build-preseed-iso.sh, which substitutes the doubled-at placeholders;
+# the result is injected into the ISO's initrd as /preseed.cfg, which the
+# installer reads before it asks its first question.
+#
+# Nothing in here prompts. If you see a dialog on the console, something below
+# did not match and the installer fell back to asking.
+
+### Localisation
+d-i debian-installer/locale          string @@LOCALE@@
+d-i debian-installer/language        string @@LANGUAGE@@
+d-i debian-installer/country         string @@COUNTRY@@
+d-i localechooser/supported-locales  multiselect @@LOCALE@@
+d-i keyboard-configuration/xkb-keymap  select @@KEYMAP@@
+d-i keyboard-configuration/layoutcode  string @@KEYMAP@@
+d-i keyboard-configuration/modelcode   string pc105
+d-i console-setup/ask_detect           boolean false
+# xkb-keymap answers the installer's own keyboard question. The
+# keyboard-configuration *package*, installed via pkgsel/include below, asks two
+# more of its own - layout and variant - and leaving those unanswered stops the
+# install on a dialog nobody is watching. These are the human-readable choices,
+# so they track @@KEYMAP@@ only by convention; change both if you change it.
+d-i keyboard-configuration/layout      select English (UK)
+d-i keyboard-configuration/variant     select English (UK)
+d-i keyboard-configuration/model       select Generic 105-key PC
+d-i keyboard-configuration/altgr       select The default for the keyboard layout
+d-i keyboard-configuration/compose     select No compose key
+d-i keyboard-configuration/ctrl_alt_bksp boolean false
+
+### Clock and time zone
+# Hardware clock in UTC; the zone below only affects how local time is displayed.
+d-i clock-setup/utc     boolean true
+d-i time/zone           string @@TIMEZONE@@
+d-i clock-setup/ntp     boolean true
+
+### Network
+# The hostname here is a placeholder. The late script below replaces it with the
+# name matching this machine's MAC address, so one ISO installs every node.
+d-i netcfg/choose_interface     select auto
+d-i netcfg/dhcp_timeout         string 60
+d-i netcfg/get_hostname         string unassigned-hostname
+d-i netcfg/get_domain           string @@DOMAIN@@
+d-i netcfg/hostname             string unassigned-hostname
+d-i hw-detect/load_firmware     boolean true
+# Do not stop to complain about a missing DHCP lease or missing firmware.
+d-i netcfg/dhcp_failed          note
+d-i netcfg/dhcp_options         select Configure network manually
+
+### Mirror
+d-i mirror/country              string manual
+d-i mirror/http/hostname        string @@MIRROR_HOST@@
+d-i mirror/http/directory       string @@MIRROR_DIR@@
+d-i mirror/http/proxy           string @@MIRROR_PROXY@@
+
+### Accounts
+# Root login with a password, no unprivileged user: the airgapped installer
+# authenticates as root over SSH.
+d-i passwd/root-login           boolean true
+d-i passwd/make-user            boolean false
+d-i passwd/root-password        password @@ROOT_PASSWORD@@
+d-i passwd/root-password-again  password @@ROOT_PASSWORD@@
+# Accept the password even though it is trivially weak.
+d-i user-setup/allow-password-weak boolean true
+d-i user-setup/encrypt-home     boolean false
+
+### Partitioning
+# Pick the first disk found rather than hard-coding /dev/sda, so this works
+# whether the VM uses virtio-scsi (sda) or virtio-blk (vda).
+# Install onto the SMALLEST disk, which is the boot disk - not the first one
+# enumerated. These VMs have a second, much larger disk for Longhorn, and the
+# order they appear in is not stable: on a three-node build the 128 GB disk came
+# up first on two machines out of three.
+#
+# Picking the first disk therefore installs Debian onto Longhorn's disk. Worse,
+# the boot order is disk-then-CD, so the still-blank boot disk falls through to
+# the ISO on the next boot and the machine installs itself a second time - a
+# loop that leaves a Debian install on both disks and no usable data disk.
+#
+# This matches the Ubuntu autoinstall path, which uses `match: size: smallest`.
+d-i partman/early_command string \
+    BOOTDISK="$(for d in $(list-devices disk); do \
+        echo "$(cat /sys/block/${d#/dev/}/size) $d"; \
+      done | sort -n | head -n1 | cut -d' ' -f2)"; \
+    debconf-set partman-auto/disk "$BOOTDISK"; \
+    debconf-set grub-installer/bootdev "$BOOTDISK"
+
+d-i partman-auto/method                     string regular
+# 'atomic' = everything in one partition, which keeps /var free to grow for
+# container images and Harbor's local-path volumes.
+d-i partman-auto/choose_recipe              select atomic
+d-i partman-lvm/device_remove_lvm           boolean true
+d-i partman-md/device_remove_md             boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition                select finish
+d-i partman/confirm                         boolean true
+d-i partman/confirm_nooverwrite             boolean true
+d-i partman-basicfilesystems/no_swap        boolean false
+
+### Base system and packages
+d-i apt-setup/non-free-firmware  boolean true
+d-i apt-setup/non-free           boolean false
+d-i apt-setup/contrib            boolean false
+d-i apt-setup/services-select    multiselect security, updates
+# Drop the installer CD from the target's sources.list. Left in, any later
+# apt-get inside the target picks the cdrom method and blocks forever waiting
+# for a disc change that nobody is there to confirm.
+d-i apt-setup/disable-cdrom-entries boolean true
+tasksel tasksel/first            multiselect standard, ssh-server
+# python3 is what Ansible needs; qemu-guest-agent lets Proxmox report the IP.
+d-i pkgsel/include               string python3 qemu-guest-agent sudo curl ca-certificates console-setup keyboard-configuration kbd
+d-i pkgsel/upgrade               select full-upgrade
+popularity-contest popularity-contest/participate boolean false
+
+### Bootloader
+# systemd 256+ ships systemd-ssh-generator, which tries to bind SSH to an
+# AF_VSOCK socket so a hypervisor can reach the guest without networking.
+# Proxmox attaches no vhost-vsock device, so the query fails and the generator
+# logs "Failed to query local AF_VSOCK CID" - once per systemd daemon-reload,
+# which on a Kubernetes node is often enough to bury the console.
+#
+# Nothing here needs SSH over vsock, so turn the automatic binding off.
+# add-kernel-opts is the installer's own "boot options for the target system".
+d-i debian-installer/add-kernel-opts string systemd.ssh_auto=no
+
+d-i grub-installer/only_debian   boolean true
+d-i grub-installer/with_other_os boolean true
+
+### Finish
+d-i finish-install/reboot_in_progress note
+# The VM's boot order is disk-then-CD, so it boots the installed system from
+# here on without anyone detaching the ISO.
+d-i cdrom-detect/eject boolean true
+
+### Per-node identity
+# /d-i-finish.sh is injected into the initrd alongside this file. It matches the
+# machine's MAC against the table baked into it and sets the hostname (and a
+# static address, where one was configured).
+d-i preseed/late_command string /bin/sh /d-i-finish.sh

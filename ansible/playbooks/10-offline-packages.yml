@@ -1,0 +1,151 @@
+---
+# Two things the k3s-ansible prereq role needs on a Debian-family node:
+#   * python3-apt  - the ansible.builtin.apt module cannot run without it
+#   * policycoreutils - the role apt-installs it on Ubuntu for restorecon
+# An airgapped node has no apt mirror, so install the .debs that
+# scripts/01-download-artifacts.sh staged for this exact OS release.
+#
+# Deliberately avoids ansible.builtin.package_facts and ansible.builtin.apt:
+# both need python3-apt, which is one of the things we may be installing.
+- name: Stage offline OS packages
+  hosts: k3s_cluster
+  gather_facts: true
+  become: true
+  vars:
+    offline_deb_root: /opt/airgap/debs        # inside the installer container
+    offline_deb_stage: /tmp/airgap-debs       # on the node
+    offline_packages:
+      - python3-apt
+      - policycoreutils
+  tasks:
+    - name: Identify the exact OS release
+      ansible.builtin.command:
+        cmd: sh -c '. /etc/os-release; echo "${ID}-${VERSION_ID}"'
+      register: offline_release
+      changed_when: false
+
+    - name: Record release id
+      ansible.builtin.set_fact:
+        offline_release_id: "{{ offline_release.stdout | trim }}"
+
+    - name: Determine which packages are missing
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          for p in {{ offline_packages | join(' ') }}; do
+            dpkg-query -W -f='${Status}' "$p" 2>/dev/null \
+              | grep -q 'install ok installed' || echo "$p"
+          done
+        executable: /bin/bash
+      register: offline_check
+      changed_when: false
+
+    - name: Record missing packages
+      ansible.builtin.set_fact:
+        offline_missing: "{{ offline_check.stdout_lines | select | list }}"
+
+    - name: Already satisfied
+      when: offline_missing | length == 0
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ offline_release_id }}): {{ offline_packages | join(', ') }} already installed"
+
+    - name: Install staged packages
+      when: offline_missing | length > 0
+      block:
+        - name: Look for staged .debs for this release
+          delegate_to: localhost
+          become: false
+          ansible.builtin.find:
+            paths: "{{ offline_deb_root }}/{{ offline_release_id }}"
+            patterns: "*.deb"
+          register: offline_debs
+          failed_when: false
+
+        - name: No staged packages for this release
+          when: (offline_debs.files | default([])) | length == 0
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }} is missing {{ offline_missing | join(', ') }} but no .debs
+              were staged for '{{ offline_release_id }}'. On the connected build host add that
+              release to OFFLINE_DEB_IMAGES in config/versions.env (as
+              "{{ offline_release_id | regex_replace('-', ':') }}"), re-run
+              scripts/01-download-artifacts.sh and rebuild the installer.
+
+        - name: Create staging directory on the node
+          ansible.builtin.file:
+            path: "{{ offline_deb_stage }}"
+            state: directory
+            mode: "0700"
+
+        - name: Copy .debs to the node
+          ansible.builtin.copy:
+            src: "{{ item.path }}"
+            dest: "{{ offline_deb_stage }}/"
+            mode: "0644"
+          loop: "{{ offline_debs.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+
+        # Only packages that are not installed at all are touched. Anything the
+        # node already has stays at the version it already has - an airgapped
+        # machine is not the place for surprise upgrades.
+        - name: Install the .debs the node is actually missing
+          ansible.builtin.shell:
+            cmd: |
+              set -eu -o pipefail
+              install_list=""
+              for deb in {{ offline_deb_stage }}/*.deb; do
+                pkg="$(dpkg-deb -f "$deb" Package)"
+                if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                  install_list="$install_list $deb"
+                fi
+              done
+              if [ -z "$install_list" ]; then
+                echo "NOTHING_TO_DO"
+                exit 0
+              fi
+              echo "installing:$install_list"
+              # Two passes, then configure. dpkg unpacks archives in the order
+              # given, and a package whose Pre-Depends happens to sort later in
+              # the glob fails the first time round and succeeds the second,
+              # once its dependency is already on disk.
+              # shellcheck disable=SC2086
+              dpkg --install --force-confold $install_list || true
+              # shellcheck disable=SC2086
+              dpkg --install --force-confold $install_list || true
+              dpkg --configure -a
+            executable: /bin/bash
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          register: offline_dpkg
+          changed_when: "'NOTHING_TO_DO' not in offline_dpkg.stdout"
+          failed_when: false   # the assertion below is the real check
+
+        - name: Re-check the packages
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              for p in {{ offline_packages | join(' ') }}; do
+                dpkg-query -W -f='${Status}' "$p" 2>/dev/null \
+                  | grep -q 'install ok installed' || echo "$p"
+              done
+            executable: /bin/bash
+          register: offline_recheck
+          changed_when: false
+
+        - name: Verify the packages landed
+          ansible.builtin.assert:
+            that: (offline_recheck.stdout_lines | select | list) | length == 0
+            fail_msg: >-
+              Still missing {{ offline_recheck.stdout_lines | select | list | join(', ') }} on
+              {{ inventory_hostname }} after installing the staged .debs.
+              If dpkg complains about Pre-Depends, the staged set is missing a
+              dependency this node does not already have - add the package to
+              OFFLINE_DEB_PACKAGES and re-stage. dpkg said:
+              {{ (offline_dpkg.stderr | default('')) | trim }}
+
+      always:
+        - name: Remove staged .debs
+          ansible.builtin.file:
+            path: "{{ offline_deb_stage }}"
+            state: absent

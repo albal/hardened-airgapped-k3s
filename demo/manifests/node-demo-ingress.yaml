@@ -1,0 +1,38 @@
+---
+# Applied only when a VIP is configured. Rendered with envsubst:
+#   ${DEMO_NAMESPACE} ${INGRESS_CLASS} ${VIP_ADDRESS}
+#
+# The NodePort Service in node-demo.yaml stays exactly as it was: it uses
+# externalTrafficPolicy: Local so http://<node>:30080/ always answers from that
+# node's own pod, which is what makes the per-node pages a useful demonstration.
+#
+# This Ingress is the opposite view of the same DaemonSet. Traefik ships with
+# k3s and klipper-lb binds :80 on every node, so whichever node currently holds
+# the VIP answers on it - no LoadBalancer integration required. Requests to
+# http://<vip>/ are balanced across all three pods, so repeated calls report
+# different nodes. That is the VIP and the ingress demonstrating themselves.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: node-demo
+  namespace: ${DEMO_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: node-demo
+  annotations:
+    # No host rule, so this would collide with any other catch-all Ingress.
+    # A low priority keeps it as the fallback rather than the winner.
+    traefik.ingress.kubernetes.io/router.priority: "1"
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+    # Deliberately no host: on an airgapped network there is no DNS to resolve
+    # one, and the VIP is the stable name. Add `host:` here once you have DNS.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: node-demo
+                port:
+                  name: http

@@ -1,0 +1,65 @@
+# The airgapped installer image.
+#
+# Built on a connected host; everything it will ever need is baked in. On the
+# airgapped side it only speaks SSH to the nodes and HTTP(S) to the cluster it
+# builds.
+FROM python:3.13-slim-bookworm
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ANSIBLE_CORE_SPEC="ansible-core>=2.17,<2.21"
+
+# skopeo pushes the demo image into Harbor straight from a docker-archive
+# tarball, so no docker daemon is needed on the airgapped side.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-client \
+      sshpass \
+      skopeo \
+      ca-certificates \
+      curl \
+      jq \
+      gettext-base \
+      openssl \
+      less \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir "${ANSIBLE_CORE_SPEC}" netaddr jmespath
+
+# ansible.utils.ipwrap (used by k3s-ansible for IPv6 endpoints) needs netaddr;
+# community.general and ansible.posix are the collection's declared dependencies.
+RUN ansible-galaxy collection install \
+      community.general ansible.posix ansible.utils \
+      -p /usr/share/ansible/collections
+
+COPY artifacts/bin/helm    /usr/local/bin/helm
+COPY artifacts/bin/kubectl /usr/local/bin/kubectl
+RUN chmod 0755 /usr/local/bin/helm /usr/local/bin/kubectl \
+ && helm version --short && kubectl version --client=true --output=yaml >/dev/null
+
+# --- payload: large and rarely changing, so it sits below the source layers ---
+COPY artifacts/k3s      /opt/airgap/k3s
+COPY artifacts/harbor   /opt/airgap/harbor
+COPY artifacts/longhorn /opt/airgap/longhorn
+COPY artifacts/kube-vip /opt/airgap/kube-vip
+COPY artifacts/demo     /opt/airgap/demo
+COPY artifacts/debs     /opt/airgap/debs
+
+# --- source ------------------------------------------------------------------
+COPY k3s-ansible          /opt/k3s-ansible
+COPY ansible              /opt/ansible
+COPY harbor/values-base.yaml   /opt/harbor/values-base.yaml
+COPY longhorn/values-base.yaml /opt/longhorn/values-base.yaml
+COPY demo/manifests       /opt/demo/manifests
+COPY installer            /opt/installer
+COPY config/versions.env  /opt/installer/versions.env
+
+RUN chmod 0755 /opt/installer/entrypoint.sh
+
+ENV ANSIBLE_CONFIG=/opt/ansible/ansible.cfg \
+    ANSIBLE_COLLECTIONS_PATH=/usr/share/ansible/collections \
+    PYTHONUNBUFFERED=1 \
+    HOME=/root
+
+VOLUME ["/output"]
+WORKDIR /output
+ENTRYPOINT ["/opt/installer/entrypoint.sh"]

@@ -1,0 +1,87 @@
+# Copy to terraform.tfvars and fill in the token secret.
+# terraform.tfvars is gitignored, so the secret stays out of the repository.
+
+# ---- Proxmox -------------------------------------------------------------
+pve_endpoint = "https://pve.office.tsew.net:8006/"
+pve_node     = "pve"
+pve_token_id = "root@pam!terraform"
+
+# Create the token on the PVE host with:
+#   pveum user token add root@pam terraform --privsep 0
+# and paste the secret it prints here. It is shown once and never again.
+#
+# Alternatively leave this empty and export:
+#   PROXMOX_VE_API_TOKEN='root@pam!terraform=<secret>'
+pve_token_secret = ""
+
+# Proxmox uses a self-signed certificate out of the box.
+pve_insecure = true
+
+# ---- Install media and storage -------------------------------------------
+# /var/lib/vz is the 'local' storage, so
+# /var/lib/vz/template/iso/debian-13.6.0-amd64-netinst.iso is:
+iso_file_id = "local:iso/debian-13.6.0-amd64-netinst.iso"
+#
+# Run ./build-install-iso.sh to turn that ISO into one that installs itself,
+# then point this at the result so `terraform apply` gives you finished nodes
+# rather than consoles waiting at an installer:
+#
+#   iso_file_id = "local:iso/debian-13.6.0-amd64-netinst-preseed.iso"
+#
+# Ubuntu Server works too - the same script detects the ISO type and uses
+# subiquity autoinstall instead of a preseed:
+#
+#   iso_file_id = "local:iso/ubuntu-26.04.1-live-server-amd64.iso"
+#   -> builds  local:iso/ubuntu-26.04.1-live-server-amd64-autoinstall.iso
+
+datastore_id   = "local-lvm"
+network_bridge = "vmbr0"
+# vlan_id      = 20
+
+# ---- Guest agent ---------------------------------------------------------
+# The preseed ISO installs qemu-guest-agent, so Proxmox can report guest IPs
+# and shut guests down gracefully. Set this false only if you install the
+# guests by hand from the stock ISO without the agent - Terraform waits for the
+# agent, so declaring one that never runs makes every apply hang.
+qemu_agent_enabled = true
+# Must outlast the unattended install on a first apply (~10 min per node).
+qemu_agent_timeout = "30m"
+
+# ---- VM sizing -----------------------------------------------------------
+default_cores     = 4
+default_memory    = 8192
+default_disk_size = 40
+
+# ---- The three nodes -----------------------------------------------------
+# The MACs are how the preseed ISO tells the three machines apart: one ISO
+# installs all of them, and each gets the hostname its MAC is listed against
+# here. They are required if you build the preseed ISO.
+#
+# Addressing is DHCP by default. To pin it instead, uncomment ip_address /
+# gateway / nameservers - the preseed then writes a static configuration, and
+# you know every node's address before it has booted once.
+nodes = {
+  "k3s-node-1" = {
+    vm_id       = 9101
+    mac_address = "BC:24:11:C3:00:01"
+    # ip_address  = "10.20.0.11/24"
+    # gateway     = "10.20.0.1"
+    # nameservers = "10.20.0.1"
+  }
+  "k3s-node-2" = {
+    vm_id       = 9102
+    mac_address = "BC:24:11:C3:00:02"
+    # ip_address  = "10.20.0.12/24"
+    # gateway     = "10.20.0.1"
+    # nameservers = "10.20.0.1"
+  }
+  "k3s-node-3" = {
+    vm_id       = 9103
+    mac_address = "BC:24:11:C3:00:03"
+    # ip_address  = "10.20.0.13/24"
+    # gateway     = "10.20.0.1"
+    # nameservers = "10.20.0.1"
+  }
+}
+
+tags = ["terraform", "k3s", "airgap"]

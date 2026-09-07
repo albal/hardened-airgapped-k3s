@@ -1,0 +1,104 @@
+name: CI
+
+# Everything here runs without a cluster, without credentials and without the
+# 2 GB artifact download, so a pull request gets an answer in a couple of
+# minutes. The heavier suites live in integration.yml and bundle.yml, both
+# triggered on demand.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck
+        run: |
+          # The library files are sourced, never executed, so tell shellcheck
+          # which shell they are and not to chase the source paths.
+          shellcheck --external-sources --severity=warning \
+            scripts/*.sh scripts/lib/*.sh \
+            installer/*.sh installer/lib/*.sh \
+            docker/*.sh terraform/*.sh \
+            tests/ansible/*.sh tests/ansible/unit/*.sh
+
+      - name: POSIX shell syntax
+        run: |
+          sh -n demo/nginx/20-render-node-page.sh
+          sh -n ansible/playbooks/files/detect-longhorn-disk.sh
+
+      - name: Bash syntax
+        run: |
+          for f in scripts/*.sh scripts/lib/*.sh installer/*.sh installer/lib/*.sh \
+                   docker/*.sh terraform/*.sh tests/ansible/*.sh; do
+            bash -n "$f"
+          done
+
+  ansible:
+    name: Ansible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible and linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible-core>=2.17,<2.21" ansible-lint yamllint netaddr jmespath
+
+      - name: Install the collections the playbooks use
+        run: ansible-galaxy collection install community.general ansible.posix ansible.utils
+
+      - name: Unit tests
+        run: ./tests/ansible/unit/test-detect-longhorn-disk.sh
+
+      - name: Syntax, lint and YAML
+        run: ./tests/ansible/run-static.sh
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform -chdir=terraform fmt -check -diff
+
+      # -backend=false: no state, no credentials. The provider schema still has
+      # to be downloaded, which is why this needs network but not a Proxmox.
+      - name: Init
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform -chdir=terraform validate
+
+      - name: Test
+        run: terraform -chdir=terraform test

@@ -1,0 +1,161 @@
+#!/bin/sh
+# preseed/late_command - runs inside the Debian installer with the new system
+# mounted at /target.
+#
+# One ISO installs every node, so the per-machine identity has to be decided
+# here. The table below is baked in by build-preseed-iso.sh from the `nodes`
+# variable in terraform.tfvars; this script matches the machine's MAC against it.
+#
+# Fields, '|' separated: MAC|HOSTNAME|ADDRESS/CIDR|GATEWAY|DNS
+# ('|' rather than a tab: tab is an IFS whitespace character, so consecutive
+#  tabs collapse and empty fields would vanish.)
+# ADDRESS empty means "leave the DHCP configuration netcfg already wrote".
+set -eu
+
+LOG=/var/log/d-i-finish.log
+exec >>"${LOG}" 2>&1
+echo "=== d-i-finish $(date -u 2>/dev/null || true) ==="
+
+NODE_TABLE='@@NODE_TABLE@@'
+DOMAIN='@@DOMAIN@@'
+
+lower() { tr 'A-Z' 'a-z'; }
+
+# ---------------------------------------------------------------------------
+# Work out which node this machine is, by MAC.
+# ---------------------------------------------------------------------------
+hostname=""
+address=""
+gateway=""
+dns=""
+iface=""
+
+for dev in /sys/class/net/*; do
+  [ -e "${dev}/address" ] || continue
+  devname="$(basename "${dev}")"
+  [ "${devname}" = "lo" ] && continue
+  devmac="$(cat "${dev}/address" | lower)"
+
+  echo "interface ${devname} has MAC ${devmac}"
+
+  # The loop body runs in a subshell, so the match is handed back through a file.
+  echo "${NODE_TABLE}" | while IFS='|' read -r mac name addr gw ns; do
+    [ -n "${mac:-}" ] || continue
+    [ "$(echo "${mac}" | lower)" = "${devmac}" ] || continue
+    printf '%s|%s|%s|%s|%s\n' "${devname}" "${name}" "${addr}" "${gw}" "${ns}" > /tmp/d-i-match
+  done
+
+  if [ -f /tmp/d-i-match ]; then
+    IFS='|' read -r iface hostname address gateway dns < /tmp/d-i-match
+    rm -f /tmp/d-i-match
+    echo "matched node '${hostname}' on ${iface}"
+    break
+  fi
+done
+
+if [ -z "${hostname}" ]; then
+  # Unknown MAC: still give the machine a unique name rather than leaving three
+  # nodes all called the same thing, which Kubernetes will not accept.
+  suffix="$(cat /sys/class/net/*/address 2>/dev/null | grep -v '00:00:00:00:00:00' \
+            | head -n1 | tr -d ':' | tail -c 7)"
+  hostname="debian-${suffix:-unknown}"
+  echo "WARNING: no table entry for this machine's MAC; falling back to ${hostname}"
+fi
+
+# ---------------------------------------------------------------------------
+# Hostname
+# ---------------------------------------------------------------------------
+echo "${hostname}" > /target/etc/hostname
+{
+  echo "127.0.0.1	localhost"
+  if [ -n "${DOMAIN}" ]; then
+    echo "127.0.1.1	${hostname}.${DOMAIN}	${hostname}"
+  else
+    echo "127.0.1.1	${hostname}"
+  fi
+  echo ""
+  echo "::1	localhost ip6-localhost ip6-loopback"
+  echo "ff02::1	ip6-allnodes"
+  echo "ff02::2	ip6-allrouters"
+} > /target/etc/hosts
+echo "hostname set to ${hostname}"
+
+# ---------------------------------------------------------------------------
+# Static addressing, when the node was configured with one
+# ---------------------------------------------------------------------------
+if [ -n "${address}" ] && [ -n "${iface}" ]; then
+  echo "configuring ${iface} statically as ${address}"
+  {
+    echo "# Written by the k3s preseed. Regenerate the ISO to change it."
+    echo "source /etc/network/interfaces.d/*"
+    echo ""
+    echo "auto lo"
+    echo "iface lo inet loopback"
+    echo ""
+    echo "auto ${iface}"
+    echo "iface ${iface} inet static"
+    echo "	address ${address}"
+    if [ -n "${gateway}" ]; then echo "	gateway ${gateway}"; fi
+  } > /target/etc/network/interfaces
+
+  if [ -n "${dns}" ]; then
+    : > /target/etc/resolv.conf
+    for server in $(echo "${dns}" | tr ',' ' '); do
+      echo "nameserver ${server}" >> /target/etc/resolv.conf
+    done
+    if [ -n "${DOMAIN}" ]; then echo "search ${DOMAIN}" >> /target/etc/resolv.conf; fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Console keymap
+#
+# The packages themselves come from pkgsel/include; this just writes the files
+# they read. Do not be tempted to apt-get from here instead: an `in-target`
+# command that overrides the debconf frontend desynchronises d-i's passthrough
+# protocol, and the next install step exits "backed up" into the main menu.
+# ---------------------------------------------------------------------------
+mkdir -p /target/etc/default
+cat > /target/etc/default/keyboard <<KBD
+# Written by the k3s preseed.
+XKBMODEL="pc105"
+XKBLAYOUT="@@KEYMAP@@"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+KBD
+# Do not also write /etc/vconsole.conf: on Debian it is a symlink to
+# default/keyboard, so writing it just clobbers the file above.
+
+# ---------------------------------------------------------------------------
+# SSH: the airgapped installer logs in as root with a password.
+#
+# A drop-in rather than an edit to sshd_config: Debian's shipped config starts
+# with `Include /etc/ssh/sshd_config.d/*.conf`, and sshd takes the first value
+# it sees for a keyword, so the drop-in wins.
+# ---------------------------------------------------------------------------
+mkdir -p /target/etc/ssh/sshd_config.d
+cat > /target/etc/ssh/sshd_config.d/99-k3s-installer.conf <<'SSHD'
+# Added by the k3s preseed so the airgapped installer can reach this node.
+# Remove once the cluster is built, or replace with key-based access.
+PermitRootLogin yes
+PasswordAuthentication yes
+SSHD
+chmod 0644 /target/etc/ssh/sshd_config.d/99-k3s-installer.conf
+
+# Belt and braces: if this Debian ever ships an sshd_config without the Include
+# line, the drop-in would be silently ignored, so patch the main file too.
+if [ -f /target/etc/ssh/sshd_config ] \
+   && ! grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /target/etc/ssh/sshd_config; then
+  echo "sshd_config has no Include line; editing it directly"
+  sed -i 's/^#*[[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' /target/etc/ssh/sshd_config
+  sed -i 's/^#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /target/etc/ssh/sshd_config
+  grep -q '^PermitRootLogin' /target/etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /target/etc/ssh/sshd_config
+fi
+
+# ---------------------------------------------------------------------------
+# Leave a copy of this log where it can be read after the reboot.
+# ---------------------------------------------------------------------------
+echo "=== d-i-finish done ==="
+cp "${LOG}" /target/var/log/ 2>/dev/null || true
+exit 0
