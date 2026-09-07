@@ -112,6 +112,11 @@ for _var in K3S_NODE_IPS K3S_SSH_USER K3S_SSH_PORT K3S_SSH_PASSWORD \
   fi
 done
 
+# exec, so signals reach docker directly and no wrapper shell lingers behind the
+# installer. The `exit 0` below is unreachable defence: if exec ever fails, bash
+# exits anyway, and nothing must be allowed to fall through into the appended
+# binary payload. shellcheck before 0.11 flags the unreachable line.
+# shellcheck disable=SC2093
 exec docker run --rm "${TTY_FLAGS[@]}" \
   --network host \
   --tmpfs /run/installer:rw,nosuid,nodev,mode=0700 \

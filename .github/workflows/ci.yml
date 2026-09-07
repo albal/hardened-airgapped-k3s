@@ -25,18 +25,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: shellcheck
-        run: |
-          # The library files are sourced, never executed, so tell shellcheck
-          # which shell they are and not to chase the source paths.
-          shellcheck --external-sources --severity=warning \
-            scripts/*.sh scripts/lib/*.sh \
-            installer/*.sh installer/lib/*.sh \
-            docker/*.sh terraform/*.sh \
-            tests/ansible/*.sh tests/ansible/unit/*.sh
+      # Deliberately not apt's shellcheck: its version tracks the runner image
+      # and drifts from whatever developers have. The runner script pulls the
+      # version pinned in config/versions.env, so CI and a laptop agree.
+      - name: shellcheck (pinned version)
+        run: ./tests/shell/run-shellcheck.sh
 
       - name: POSIX shell syntax
         run: |

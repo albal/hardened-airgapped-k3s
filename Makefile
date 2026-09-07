@@ -30,6 +30,7 @@ build: ## Stage 2: build the self-executing installer into dist/
 all: download build ## Stage 1 + stage 2
 
 lint: ## Syntax-check the shell, YAML and Ansible content
+	@./tests/shell/run-shellcheck.sh && echo "  shellcheck $$(sed -n 's/^SHELLCHECK_VERSION="\(.*\)"/\1/p' config/versions.env)"
 	@set -e; \
 	for f in scripts/*.sh scripts/lib/*.sh installer/*.sh installer/lib/*.sh docker/*.sh terraform/*.sh; do \
 	  bash -n "$$f" && echo "  bash -n  $$f"; \
