@@ -50,6 +50,14 @@ report the playbook's exit status rather than whether the message appeared. Use
 the `expect_output` helper, which also prints the last lines of a failed run so
 you can see what actually happened.
 
+**Run it the way CI does, at least once.** The harness prefers the full
+installer image and falls back to a minimal ansible runner when it is absent —
+which is what a GitHub runner always gets. The two are not interchangeable: the
+installer image bakes in `/opt/airgap/debs`, the minimal runner has nothing
+there, and that difference passed locally and failed in CI. `MINIMAL_RUNNER=1
+make test-integration` forces the fallback even when the installer image is
+built.
+
 Each test also sets up its own preconditions. Tests that share a container are
 otherwise order-dependent: a test asserting "this fails when the packages are
 missing" proves nothing if an earlier test installed them.

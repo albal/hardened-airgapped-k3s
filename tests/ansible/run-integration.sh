@@ -43,7 +43,11 @@ FAIL=0
 # four-minute test.
 IMAGE="$(sed -n 's/^INSTALLER_IMAGE="\(.*\)"/\1/p' config/versions.env)"
 TAG="$(sed -n 's/^INSTALLER_TAG="\(.*\)"/\1/p' config/versions.env)"
-if ! docker image inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+# MINIMAL_RUNNER=1 ignores an installer image that *is* present, so a developer
+# can reproduce what CI does. That difference has already cost one green local
+# run and a red CI one: the installer image bakes in /opt/airgap/debs, the
+# minimal runner does not.
+if [[ -n "${MINIMAL_RUNNER:-}" ]] || ! docker image inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
   IMAGE="k3s-airgap-test-runner"; TAG="local"
   if ! docker image inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
     log "installer image not built - building a minimal ansible runner"
@@ -57,6 +61,11 @@ RUNNER
     docker build -q -t "${IMAGE}:${TAG}" "${WORK}/runner" >/dev/null       || die "could not build the test runner image"
   fi
 fi
+
+# Docker creates a missing bind-mount source as a root-owned directory in the
+# working tree, so make it here instead. Empty is fine - the deb tests skip.
+DEBS_DIR="${REPO_ROOT}/artifacts/debs"
+mkdir -p "${DEBS_DIR}"
 
 cleanup() {
   local i
@@ -134,10 +143,16 @@ dim "nodes: ${NODE_IPS[*]}"
   echo "vip_address: \"\""
 } > "${WORK}/vars.yml"
 
+# 10-offline-packages.yml looks for the staged .debs at offline_deb_root
+# (/opt/airgap/debs) on the *controller*, which in production is the installer
+# image that baked them in. The minimal runner has no such directory, so mount
+# them there. Doing it unconditionally keeps both runners on the same content:
+# the image's copy came from artifacts/debs in the first place.
 play() {
   local playbook="$1"; shift
   docker run --rm --network "${NET}" \
     -v "${REPO_ROOT}:/repo:ro" -v "${WORK}:/work" \
+    -v "${DEBS_DIR}:/opt/airgap/debs:ro" \
     -e INSTALLER_SSH_PASSWORD="${SSH_PASSWORD}" \
     -e ANSIBLE_CONFIG=/repo/tests/ansible/ansible.cfg \
     -e ANSIBLE_STDOUT_CALLBACK=default \
